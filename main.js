@@ -1,10 +1,11 @@
 // main.js / bot.js
-// sibidi v3:
+// sibidi v4 (conversational):
 // - Trigger: "sibidi ..." hoặc mention @bot + có chữ "sibidi"
 // - Rate limit: 1 request / 5s / user
 // - Gửi "đợi tí để nghĩ phát..." rồi xóa khi trả lời xong
 // - Luôn trả lời tiếng Việt, auto dịch tiếng Anh
 // - Ghi nhớ "persona" theo từng chat (VD: "từ giờ bạn sẽ là em tôi")
+// - Ghi nhớ luôn lịch sử hội thoại theo từng chat để nói chuyện tự nhiên
 
 require("dotenv").config();
 const { Telegraf } = require("telegraf");
@@ -49,6 +50,10 @@ const RATE_LIMIT_MS = 5000; // 5 giây
 
 // Persona per chat: chatId -> instruction string
 const personaByChat = new Map();
+
+// History per chat: chatId -> [{ role: "user"|"assistant", content: string }]
+const historyByChat = new Map();
+const MAX_HISTORY_MESSAGES = 20; // giới hạn số message để không quá dài
 
 // ================== HELPER ==================
 function extractPrompt(ctx) {
@@ -113,6 +118,29 @@ function shouldUpdatePersona(prompt) {
   return false;
 }
 
+// Lấy history cho chat
+function getHistoryForChat(chatId) {
+  if (!chatId) return [];
+  return historyByChat.get(chatId) || [];
+}
+
+// Lưu history cho chat
+function updateHistoryForChat(chatId, userPrompt, assistantReply) {
+  if (!chatId) return;
+  const history = historyByChat.get(chatId) || [];
+  history.push({ role: "user", content: userPrompt });
+  history.push({ role: "assistant", content: assistantReply });
+
+  // Giới hạn độ dài history
+  if (history.length > MAX_HISTORY_MESSAGES) {
+    // cắt bỏ phần đầu
+    const sliced = history.slice(history.length - MAX_HISTORY_MESSAGES);
+    historyByChat.set(chatId, sliced);
+  } else {
+    historyByChat.set(chatId, history);
+  }
+}
+
 // ================== HANDLERS ==================
 bot.on("text", async (ctx) => {
   const msg = ctx.message;
@@ -158,18 +186,23 @@ bot.on("text", async (ctx) => {
     });
 
     // Base system prompt: luôn trả lời tiếng Việt, auto dịch nếu user dùng tiếng Anh
+    // + Hạn chế câu mời mọc chung chung
     const baseSystem =
-      "Bạn là trợ lý AI thân thiện, luôn trả lời hoàn toàn bằng tiếng Việt. " +
+      "Bạn là trợ lý AI thân thiện, luôn trả lời HOÀN TOÀN bằng tiếng Việt. " +
       "Nếu người dùng nhập bằng tiếng Anh hoặc có đoạn tiếng Anh, hãy dịch phần đó sang tiếng Việt và giải thích ngắn gọn nếu cần. " +
-      "Giữ cách nói gần gũi, dễ hiểu.";
+      "Giữ cách nói gần gũi, tự nhiên như bạn bè nói chuyện với nhau, không quá máy móc, không quá trang trọng. " +
+      "KHÔNG được tự động kết thúc câu bằng những câu mời chung chung kiểu như " +
+      "'Nếu cần gì cứ hỏi thêm', 'Nếu bạn còn câu hỏi...' trừ khi người dùng nói là đã xong, hết hỏi, hoặc tạm biệt. " +
+      "Khi người dùng chỉ nhắn các từ rất ngắn như 'ok', 'oke', 'okay', 'ừ', 'ừm', 'vâng', 'dạ'..., " +
+      "hãy trả lời thật ngắn gọn (ví dụ 'ok nha 😄', 'rồi đó', 'oke') và KHÔNG hỏi thêm 'bạn cần gì nữa không'.";
 
-    // Build messages cho OpenAI: base system + optional persona + user prompt
-    const messages = [
-      { role: "system", content: baseSystem },
-    ];
+    // Lấy history của chat để gửi lên OpenAI (giúp giữ mạch hội thoại)
+    const history = getHistoryForChat(chatId);
+
+    // Build messages cho OpenAI: base system + optional persona + history + user prompt
+    const messages = [{ role: "system", content: baseSystem }];
 
     if (personaInstruction) {
-      // Ví dụ: "từ giờ bạn sẽ là em tôi" → OpenAI sẽ luôn xưng "em"
       messages.push({
         role: "system",
         content:
@@ -178,11 +211,18 @@ bot.on("text", async (ctx) => {
       });
     }
 
+    // thêm history (chỉ bao gồm role user/assistant)
+    for (const h of history) {
+      messages.push(h);
+    }
+
+    // cuối cùng là câu hỏi hiện tại
     messages.push({
       role: "user",
       content: prompt,
     });
 
+    // Gọi OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
@@ -206,6 +246,10 @@ bot.on("text", async (ctx) => {
       return;
     }
 
+    // Lưu history cuộc trò chuyện
+    updateHistoryForChat(chatId, prompt, replyText);
+
+    // Gửi reply
     await ctx.reply(replyText, {
       reply_to_message_id: msg.message_id,
       parse_mode: "Markdown",
@@ -256,7 +300,7 @@ bot.command("sibidi_test", async (ctx) => {
     console.log("🤖 Bot id:", BOT_ID);
 
     await bot.launch();
-    console.log("✅ Bot Telegram đã chạy với trigger 'sibidi' (v3)!");
+    console.log("✅ Bot Telegram đã chạy với trigger 'sibidi' (v4, conversational)!");
   } catch (err) {
     console.error("❌ Lỗi khi khởi động bot:", err.message);
     process.exit(1);
